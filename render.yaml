@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: linkwatch
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PUBLIC_BASE_URL
+        value: https://your-subdomain.onrender.com
+      - key: RATE_LIMIT_PER_MIN
+        value: "10"
+      - key: SCAN_CONCURRENCY
+        value: "8"
+      - key: SCAN_TIMEOUT_SECONDS
+        value: "10"
+      - key: SCAN_MAX_PAGES_FREE
+        value: "150"
+      - key: SCAN_MAX_PAGES_HARD
+        value: "5000"
+      - key: LW_USER_AGENT
+        value: LinkWatch/0.9.0 (+https://your-domain.com)
+      # Optional analytics:
+      - key: PLAUSIBLE_DOMAIN
+        value: ""
+      - key: GOOGLE_SITE_VERIFICATION
+        value: ""
+      # Optional email:
+      - key: SMTP_HOST
+        value: ""
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        value: ""
+      - key: SMTP_PASS
+        value: ""
+      - key: REPORT_EMAIL_FROM
+        value: ""
