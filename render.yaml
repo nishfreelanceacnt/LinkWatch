@@ -2,8 +2,8 @@ services:
   - type: web
     name: linkwatch
     env: python
-    plan: free               # upgrade later if needed
-    region: oregon           # or frankfurt, singapore, etc.
+    plan: free
+    region: oregon
     branch: main
     rootDir: .
     buildCommand: |
@@ -13,16 +13,8 @@ services:
     healthCheckPath: /healthz
     autoDeploy: true
 
-    # Persist reports & DB across deploys
-    disk:
-      name: data
-      mountPath: /var/data
-      sizeGB: 1
-
     envVars:
-      # App config (safe to keep in VCS)
-      - key: LW_DB_PATH
-        value: /var/data/linkwatch.db
+      # App config
       - key: RATE_LIMIT_PER_MIN
         value: "10"
       - key: SCAN_CONCURRENCY
@@ -35,16 +27,18 @@ services:
         value: "5000"
       - key: LW_USER_AGENT
         value: "LinkWatch/0.9.0 (+https://example.com)"
-      # Optional analytics/SEO
+      - key: PUBLIC_BASE_URL
+        value: "https://linkwatch.onrender.com"
       - key: PLAUSIBLE_DOMAIN
         value: ""
       - key: GOOGLE_SITE_VERIFICATION
         value: ""
-      # Public URL (fill after first deploy or if you have a custom domain)
-      - key: PUBLIC_BASE_URL
-        value: "https://linkwatch.onrender.com"
 
-      # Secrets — manage in the Render dashboard (won’t be overwritten by YAML)
+      # Use Postgres instead of a disk-backed SQLite file
+      - key: DATABASE_URL
+        sync: false   # set the real value in the dashboard
+
+      # Email (optional)
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
