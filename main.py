@@ -154,6 +154,20 @@ def db_conn():
 def db_init():
     with db_conn() as con:
         cur = con.cursor()
+        CREATE TABLE IF NOT EXISTS links (
+        id SERIAL PRIMARY KEY,
+        url TEXT NOT NULL,
+        status_code INT,
+        checked_at TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS reports (
+        id SERIAL PRIMARY KEY,
+        email TEXT NOT NULL,
+        report_data JSONB,
+        created_at TIMESTAMP DEFAULT NOW()
+        );
+
         cur.execute("""
           CREATE TABLE IF NOT EXISTS scans(
             id TEXT PRIMARY KEY,
@@ -666,3 +680,4 @@ def _startup():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT","8000")), reload=True)
+
