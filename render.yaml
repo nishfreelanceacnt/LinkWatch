@@ -2,12 +2,27 @@ services:
   - type: web
     name: linkwatch
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free               # upgrade later if needed
+    region: oregon           # or frankfurt, singapore, etc.
+    branch: main
+    rootDir: .
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: |
+      uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    autoDeploy: true
+
+    # Persist reports & DB across deploys
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
+
     envVars:
-      - key: PUBLIC_BASE_URL
-        value: https://your-subdomain.onrender.com
+      # App config (safe to keep in VCS)
+      - key: LW_DB_PATH
+        value: /var/data/linkwatch.db
       - key: RATE_LIMIT_PER_MIN
         value: "10"
       - key: SCAN_CONCURRENCY
@@ -19,20 +34,24 @@ services:
       - key: SCAN_MAX_PAGES_HARD
         value: "5000"
       - key: LW_USER_AGENT
-        value: LinkWatch/0.9.0 (+https://your-domain.com)
-      # Optional analytics:
+        value: "LinkWatch/0.9.0 (+https://example.com)"
+      # Optional analytics/SEO
       - key: PLAUSIBLE_DOMAIN
         value: ""
       - key: GOOGLE_SITE_VERIFICATION
         value: ""
-      # Optional email:
+      # Public URL (fill after first deploy or if you have a custom domain)
+      - key: PUBLIC_BASE_URL
+        value: "https://linkwatch.onrender.com"
+
+      # Secrets — manage in the Render dashboard (won’t be overwritten by YAML)
       - key: SMTP_HOST
-        value: ""
+        sync: false
       - key: SMTP_PORT
-        value: "587"
+        sync: false
       - key: SMTP_USER
-        value: ""
+        sync: false
       - key: SMTP_PASS
-        value: ""
+        sync: false
       - key: REPORT_EMAIL_FROM
-        value: ""
+        sync: false
