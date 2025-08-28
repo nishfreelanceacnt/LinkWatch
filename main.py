@@ -5,7 +5,7 @@ from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
 
-from fastapi import FastAPI, Request, Form, HTTPException, Query
+from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -27,13 +27,57 @@ def db_conn():
     if HAS_PG:
         return psycopg2.connect(DATABASE_URL)
     else:
-        # local sqlite fallback
         return sqlite3.connect("linkwatch.db")
+
+def _pg_cols(con) -> Dict[str, str]:
+    """Return {col_name: data_type} for Postgres reports table."""
+    cur = con.cursor()
+    cur.execute("""
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_name='reports'
+    """)
+    rows = cur.fetchall()
+    return {r[0].lower(): (r[1].lower() if isinstance(r[1], str) else str(r[1]).lower()) for r in rows}
+
+def _sqlite_cols(con) -> Dict[str, str]:
+    """Return {col_name: decl_type} for SQLite reports table."""
+    cur = con.cursor()
+    cur.execute("PRAGMA table_info(reports)")
+    rows = cur.fetchall()  # cid, name, type, notnull, dflt_value, pk
+    return {r[1].lower(): (r[2].lower() if isinstance(r[2], str) else str(r[2]).lower()) for r in rows}
+
+# Globals describing current reports schema
+REPORTS_ID_TYPE = "uuid"     # "uuid" or "int"
+REPORTS_JSON_COL = "report_json"  # "report_json" or "report_data"
+
+def _detect_schema(con):
+    global REPORTS_ID_TYPE, REPORTS_JSON_COL
+    cols = _pg_cols(con) if HAS_PG else _sqlite_cols(con)
+
+    # id type
+    if "id" in cols:
+        t = cols["id"]
+        if "int" in t:   # integer/bigint/serial-like
+            REPORTS_ID_TYPE = "int"
+        else:
+            REPORTS_ID_TYPE = "uuid"
+    else:
+        REPORTS_ID_TYPE = "uuid"
+
+    # json column
+    if "report_json" in cols:
+        REPORTS_JSON_COL = "report_json"
+    elif "report_data" in cols:
+        REPORTS_JSON_COL = "report_data"
+    else:
+        REPORTS_JSON_COL = "report_json"
 
 def db_init():
     with db_conn() as con:
         cur = con.cursor()
         if HAS_PG:
+            # create table if missing (current schema)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS reports (
                     id UUID PRIMARY KEY,
@@ -42,6 +86,16 @@ def db_init():
                     created_at TIMESTAMP NOT NULL DEFAULT NOW()
                 );
             """)
+            # try to add missing columns (safe via try/except)
+            for stmt in [
+                "ALTER TABLE reports ADD COLUMN target_url TEXT",
+                "ALTER TABLE reports ADD COLUMN report_json JSONB",
+                "ALTER TABLE reports ADD COLUMN created_at TIMESTAMP NOT NULL DEFAULT NOW()",
+            ]:
+                try:
+                    cur.execute(stmt)
+                except Exception:
+                    pass
         else:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS reports (
@@ -51,44 +105,135 @@ def db_init():
                     created_at TEXT NOT NULL
                 )
             """)
+            # add missing columns
+            for stmt in [
+                "ALTER TABLE reports ADD COLUMN target_url TEXT",
+                "ALTER TABLE reports ADD COLUMN report_json TEXT",
+                "ALTER TABLE reports ADD COLUMN created_at TEXT",
+            ]:
+                try:
+                    cur.execute(stmt)
+                except Exception:
+                    pass
         con.commit()
 
-def db_insert_report(report_id: str, target_url: str, report: Dict):
+        # Detect actual schema after migrations
+        _detect_schema(con)
+
+        # If we still lack target_url, add it again without default (some PG versions)
+        cols = _pg_cols(con) if HAS_PG else _sqlite_cols(con)
+        if "target_url" not in cols:
+            try:
+                cur = con.cursor()
+                cur.execute("ALTER TABLE reports ADD COLUMN target_url TEXT")
+                con.commit()
+            except Exception:
+                pass
+            _detect_schema(con)
+
+def db_insert_report(target_url: str, report: Dict) -> str:
+    """Insert report, returning the new id (string). Works with int or uuid id."""
     with db_conn() as con:
         cur = con.cursor()
+        json_payload = psycopg2.extras.Json(report) if HAS_PG and REPORTS_JSON_COL == "report_json" else report
+
         if HAS_PG:
-            cur.execute(
-                "INSERT INTO reports(id, target_url, report_json, created_at) VALUES (%s,%s,%s,NOW())",
-                (report_id, target_url, psycopg2.extras.Json(report)),
-            )
+            if REPORTS_ID_TYPE == "int":
+                # old schema with SERIAL id
+                if REPORTS_JSON_COL == "report_json":
+                    cur.execute(
+                        f"INSERT INTO reports(target_url, {REPORTS_JSON_COL}, created_at) VALUES (%s, %s, NOW()) RETURNING id",
+                        (target_url, json_payload),
+                    )
+                else:
+                    cur.execute(
+                        f"INSERT INTO reports(target_url, {REPORTS_JSON_COL}, created_at) VALUES (%s, %s, NOW()) RETURNING id",
+                        (target_url, json.dumps(report)),
+                    )
+                new_id = cur.fetchone()[0]
+                con.commit()
+                return str(new_id)
+            else:
+                # current schema with uuid id
+                rid = uuid.uuid4().hex
+                if REPORTS_JSON_COL == "report_json":
+                    cur.execute(
+                        f"INSERT INTO reports(id, target_url, {REPORTS_JSON_COL}, created_at) VALUES (%s, %s, %s, NOW())",
+                        (rid, target_url, json_payload),
+                    )
+                else:
+                    cur.execute(
+                        f"INSERT INTO reports(id, target_url, {REPORTS_JSON_COL}, created_at) VALUES (%s, %s, %s, NOW())",
+                        (rid, target_url, json.dumps(report)),
+                    )
+                con.commit()
+                return rid
         else:
-            cur.execute(
-                "INSERT INTO reports(id, target_url, report_json, created_at) VALUES (?, ?, ?, ?)",
-                (report_id, target_url, json.dumps(report), datetime.datetime.utcnow().isoformat() + "Z"),
-            )
-        con.commit()
+            # SQLite
+            ts = datetime.datetime.utcnow().isoformat() + "Z"
+            cols = _sqlite_cols(con)
+            if "id" in cols and "int" in cols["id"]:
+                # integer primary key (rare for our fallback, but handle anyway)
+                cur.execute(
+                    f"INSERT INTO reports(target_url, {REPORTS_JSON_COL}, created_at) VALUES (?, ?, ?)",
+                    (target_url, json.dumps(report) if REPORTS_JSON_COL != "report_json" else json.dumps(report), ts),
+                )
+                new_id = cur.lastrowid
+                con.commit()
+                return str(new_id)
+            else:
+                rid = uuid.uuid4().hex
+                cur.execute(
+                    f"INSERT INTO reports(id, target_url, {REPORTS_JSON_COL}, created_at) VALUES (?, ?, ?, ?)",
+                    (rid, target_url, json.dumps(report), ts),
+                )
+                con.commit()
+                return rid
 
 def db_get_report(report_id: str) -> Optional[Dict]:
     with db_conn() as con:
         cur = con.cursor()
+        # choose where clause type based on id type
         if HAS_PG:
-            cur.execute("SELECT report_json FROM reports WHERE id=%s", (report_id,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            return row[0]
+            if REPORTS_ID_TYPE == "int":
+                # cast to int safely
+                try:
+                    rid = int(report_id)
+                except Exception:
+                    return None
+                cur.execute(f"SELECT {REPORTS_JSON_COL} FROM reports WHERE id=%s", (rid,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return row[0] if REPORTS_JSON_COL == "report_json" else json.loads(row[0])
+            else:
+                cur.execute(f"SELECT {REPORTS_JSON_COL} FROM reports WHERE id=%s", (report_id,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return row[0] if REPORTS_JSON_COL == "report_json" else json.loads(row[0])
         else:
-            cur.execute("SELECT report_json FROM reports WHERE id=?", (report_id,))
+            # SQLite
+            cols = _sqlite_cols(con)
+            id_is_int = "id" in cols and "int" in cols["id"]
+            if id_is_int:
+                try:
+                    rid = int(report_id)
+                except Exception:
+                    return None
+                cur.execute(f"SELECT {REPORTS_JSON_COL} FROM reports WHERE id=?", (rid,))
+            else:
+                cur.execute(f"SELECT {REPORTS_JSON_COL} FROM reports WHERE id=?", (report_id,))
             row = cur.fetchone()
             if not row:
                 return None
             return json.loads(row[0])
 
 # ---------- App ----------
-app = FastAPI(title="LinkWatch", version="0.3.0")
+app = FastAPI(title="LinkWatch", version="0.3.1")
 app.add_middleware(GZipMiddleware)
 
-# CORS (open by default; tighten if needed)
+# CORS
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
 cors_origins = ["*"] if CORS_ALLOW_ORIGINS.strip() == "*" else [o.strip() for o in CORS_ALLOW_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
@@ -232,8 +377,7 @@ LARGE_BYTES = int(os.getenv("LW_LARGE_BYTES", str(1_500_000)))  # 1.5MB default
 USER_AGENT = os.getenv("LW_UA", "LinkWatch/0.3 (+https://linkwatch)")
 HEADERS = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 
-# ---------- Tasks (progress for SSE) ----------
-# tasks[task_id] = {"status": "running|done|error", "progress": int, "message": str, "report_id": str|None}
+# ---------- Tasks (SSE progress) ----------
 tasks: Dict[str, Dict] = {}
 tasks_lock = threading.Lock()
 
@@ -245,18 +389,15 @@ def set_task(task_id: str, **kwargs):
 
 def get_task(task_id: str) -> Optional[Dict]:
     with tasks_lock:
-        return dict(tasks.get(task_id) or {})  # copy
+        return dict(tasks.get(task_id) or {})
 
 # ---------- Crawler helpers ----------
-_href_like = re.compile(r"^(?:https?:)?//|/|#|\.{1,2}/", re.I)
-
 def normalize_url(base: str, link: str) -> Optional[str]:
     if not link:
         return None
     link = link.strip()
     if link.startswith("#") or link.lower().startswith("mailto:") or link.lower().startswith("javascript:"):
         return None
-    # join relative links
     try:
         return urljoin(base, link)
     except Exception:
@@ -269,14 +410,15 @@ def same_origin(a: str, b: str) -> bool:
     except Exception:
         return False
 
-def fetch_page(url: str) -> Tuple[int, bytes, requests.Response]:
+def fetch_page(url: str):
     try:
         r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
         status = r.status_code
         content = r.content or b""
         return status, content, r
     except Exception:
-        return 0, b"", requests.Response()
+        resp = requests.Response()
+        return 0, b"", resp
 
 def detect_mixed(page_url: str, html: str) -> bool:
     try:
@@ -303,7 +445,6 @@ def crawl_site(task_id: str, start_url: str):
 
     visited: Set[str] = set()
     queue: List[Tuple[str,int]] = [(start_url, 0)]
-
     pages: List[Dict] = []
     issues: List[Dict] = []
 
@@ -332,7 +473,6 @@ def crawl_site(task_id: str, start_url: str):
                 if soup.title and soup.title.string:
                     title = soup.title.string.strip()
                 mixed = detect_mixed(final_url, content.decode("utf-8", errors="ignore"))
-                # discover links
                 if depth < MAX_DEPTH:
                     for a in soup.find_all("a"):
                         href = a.get("href")
@@ -351,7 +491,6 @@ def crawl_site(task_id: str, start_url: str):
             "mixed": bool(mixed),
         })
 
-        # flag issues
         if status >= 400 or status == 0:
             issues.append({"type":"broken","from":url,"to":final_url,"status":status,"redirects":redirects,"mixed": mixed})
         elif redirects >= 3:
@@ -361,7 +500,6 @@ def crawl_site(task_id: str, start_url: str):
         elif size >= LARGE_BYTES:
             issues.append({"type":"large","from":url,"to":final_url,"status":status,"redirects":redirects,"mixed": mixed})
 
-    # summary
     report = {
         "target": start_url,
         "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
@@ -377,14 +515,13 @@ def crawl_site(task_id: str, start_url: str):
         "pages": pages,
     }
 
-    report_id = uuid.uuid4().hex
     try:
-        db_insert_report(report_id, start_url, report)
+        new_id = db_insert_report(start_url, report)
     except Exception as e:
         set_task(task_id, status="error", message=f"Failed to save report: {e}")
         return
 
-    set_task(task_id, status="done", progress=100, message=f"Done. {report['totals']['pages']} pages.", report_id=report_id)
+    set_task(task_id, status="done", progress=100, message=f"Done. {report['totals']['pages']} pages.", report_id=new_id)
 
 # ---------- Pages ----------
 @app.get("/", response_class=HTMLResponse)
@@ -404,12 +541,10 @@ def api_scan(url: str = Form(...)):
 @app.get("/api/scan/stream/{task_id}")
 def api_stream(task_id: str):
     def gen():
-        # stream current snapshot until done/error
         last = None
         while True:
             st = get_task(task_id)
             if not st:
-                # unknown task id: end with error snapshot
                 yield f"data: {json.dumps({'status':'error','message':'Unknown task'})}\n\n"
                 return
             if st != last:
@@ -427,7 +562,6 @@ def report_page(report_id: str):
     if not rep:
         raise HTTPException(status_code=404, detail="Report not found")
     t = rep["totals"]
-    # simple summary page
     body = f"""<!doctype html><html><head>{_head("LinkWatch — Report")}</head>
 <body><div class="wrap">
   <div class="card">
@@ -471,7 +605,6 @@ def report_csv(report_id: str):
     rep = db_get_report(report_id)
     if not rep:
         raise HTTPException(status_code=404, detail="Report not found")
-    # Flatten issues into CSV rows (Type, From, To, Status, Redirects, Mixed?)
     output = io.StringIO()
     w = csv.writer(output)
     w.writerow(["Type","From","To","Status","Redirects","Mixed?"])
@@ -496,7 +629,7 @@ def sitemap(request: Request):
 # ---------- Health ----------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "version": "0.3.0"}
+    return {"ok": True, "version": "0.3.1"}
 
 # ---------- Startup ----------
 @app.on_event("startup")
