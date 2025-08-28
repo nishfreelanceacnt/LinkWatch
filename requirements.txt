@@ -4,4 +4,6 @@ httpx==0.27.0
 beautifulsoup4==4.12.3
 python-multipart==0.0.9
 psycopg2-binary
+requests>=2.31.0
+
 
