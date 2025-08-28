@@ -334,7 +334,8 @@ pre{{background:#0a0f24;border:1px solid #26335f;border-radius:12px;padding:12px
 </style>
 """
 
-HOME_HTML = f"""<!doctype html><html><head>{_head("LinkWatch — Broken Links & Issues Scanner")}</head>
+def home_html() -> str:
+    return """<!doctype html><html><head>__HEAD__</head>
 <body><div class="wrap">
   <div class="card">
     <h1>LinkWatch</h1>
@@ -369,34 +370,35 @@ async function startScan(){
   const u = $("url").value.trim();
   if(!u){ $("label").innerHTML = "<small>Enter a URL first.</small>"; return; }
   const form = new FormData(); form.set("url", u);
-  const r = await fetch("/api/scan", {{ method:"POST", body:form }});
-  if(!r.ok){{ $("label").innerHTML = "<small>Failed to start</small>"; return; }}
-  const {{ task_id }} = await r.json();
+  const r = await fetch("/api/scan", { method:"POST", body:form });
+  if(!r.ok){ $("label").innerHTML = "<small>Failed to start</small>"; return; }
+  const { task_id } = await r.json();
   const es = new EventSource("/api/scan/stream/" + task_id);
-  es.onmessage = (e) => {{
+  es.onmessage = (e) => {
     const st = JSON.parse(e.data);
     $("bar").style.width = (st.progress||0) + "%";
     $("label").innerHTML = "<small>" + (st.message || "") + "</small>";
-    if(st.status === "done"){{
+    if(st.status === "done"){
       es.close();
-      if(st.report_id){{
+      if(st.report_id){
         $("dl-json").href = "/report/" + st.report_id + ".json";
         $("dl-csv").href  = "/report/" + st.report_id + ".csv";
         $("dl-json").removeAttribute("aria-disabled");
         $("dl-csv").removeAttribute("aria-disabled");
         $("open-report").innerHTML = '<a class="btn" style="margin-left:8px" href="/report/' + st.report_id + '">Open Report</a>';
-      }}
-    }}
-    if(st.status === "error"){{
+      }
+    }
+    if(st.status === "error"){
       es.close();
       $("label").innerHTML = "<small style='color:#ef6f6c'>Error: " + (st.message||"") + "</small>";
-    }}
-  }};
+    }
+  };
 }
 
 $("start").addEventListener("click", startScan);
 </script>
-</body></html>"""
+</body></html>""".replace("__HEAD__", _head("LinkWatch — Broken Links & Issues Scanner"))
+
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -598,3 +600,4 @@ def _startup():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT","8000")))
+
