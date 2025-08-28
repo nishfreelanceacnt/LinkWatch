@@ -634,8 +634,210 @@ def report_csv(id: str = Query(...)):
 @app.on_event("startup")
 def _startup():
     db_init()
+# === BEGIN LINKWATCH PATCH v0.2 (resilient fetch + debug + fixed report page) ===
+# Safe: duplicate imports are fine
+import os, time, json
+from fastapi import Query
+from fastapi.responses import HTMLResponse, JSONResponse
+
+# ----- Resilient outbound fetch (monkey-patch requests.get) -----
+try:
+    LW_USER_AGENT
+except NameError:
+    LW_USER_AGENT = os.getenv("LW_USER_AGENT", "LinkWatch/1.0 (+https://example.com)").strip()
+
+BROWSER_HEADERS = {
+    "User-Agent": LW_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.8",
+    "Cache-Control": "no-cache",
+}
+
+# Keep the original to fall back on
+try:
+    _REAL_REQUESTS_GET = requests.get  # type: ignore[name-defined]
+except Exception:
+    _REAL_REQUESTS_GET = None
+
+def _patched_requests_get(url, *args, **kwargs):
+    """
+    First try: your UA only. On exception, retry with browser-ish headers.
+    Preserves kwargs (timeout, allow_redirects, etc.)
+    """
+    if _REAL_REQUESTS_GET is None:
+        raise RuntimeError("requests not available")
+    # First try: inject our UA but preserve any provided headers
+    h1 = {**({"User-Agent": LW_USER_AGENT}), **(kwargs.get("headers") or {})}
+    try:
+        return _REAL_REQUESTS_GET(url, *args, **{**kwargs, "headers": h1})
+    except Exception:
+        # Second try: browser-ish
+        h2 = {**BROWSER_HEADERS, **(kwargs.get("headers") or {})}
+        return _REAL_REQUESTS_GET(url, *args, **{**kwargs, "headers": h2})
+
+# Monkey-patch only if not already patched
+try:
+    if getattr(requests.get, "__name__", "") != "_patched_requests_get":  # type: ignore[attr-defined]
+        requests.get = _patched_requests_get  # type: ignore[assignment]
+except Exception:
+    pass
+
+# ----- Debug fetch endpoint -----
+@app.get("/_debug/fetch")
+def _debug_fetch(url: str = Query(...), timeout: int = Query(8)):
+    t0 = time.perf_counter()
+    try:
+        r = requests.get(url, timeout=timeout, allow_redirects=True)  # patched above
+        info = {
+            "ok": True,
+            "status": r.status_code,
+            "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+            "final_url": getattr(r, "url", url),
+            "history": [{"status": h.status_code, "url": getattr(h, "url", "")} for h in getattr(r, "history", [])],
+            "content_type": r.headers.get("Content-Type"),
+            "bytes": len(r.content or b""),
+        }
+        # Include a snippet for text responses to verify what we got
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "text" in ctype or "json" in ctype or "xml" in ctype:
+            try:
+                info["snippet"] = r.text[:2000]
+            except Exception:
+                pass
+        return JSONResponse(info)
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "error": str(e), "elapsed_ms": int((time.perf_counter() - t0) * 1000)},
+            status_code=502
+        )
+
+# ----- FIXED /report page (computes totals from /api/report data) -----
+@app.get("/report", response_class=HTMLResponse)
+def report_page(id: str):
+    html = f"""
+<!doctype html><html lang="en"><head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>LinkWatch — Report</title>
+  <style>
+    body{{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto;background:#0b1020;color:#eef2ff}}
+    .wrap{{max-width:960px;margin:28px auto;padding:0 16px}}
+    .card{{background:#121933;border:1px solid #233366;border-radius:14px;padding:16px;box-shadow:0 4px 24px rgba(0,0,0,.25)}}
+    h1{{margin:0 0 8px}} small{{color:#9fb1e8}}
+    .grid{{display:grid;gap:12px}} @media(min-width:720px){{.grid{{grid-template-columns:repeat(3,1fr)}}}}
+    table{{width:100%;border-collapse:collapse;margin-top:10px}}
+    th,td{{padding:8px;border-bottom:1px solid #233366;text-align:left;vertical-align:top}}
+    .pill{{display:inline-block;background:#0a1638;border:1px solid #24336a;border-radius:999px;padding:3px 8px;margin-right:6px}}
+    a{{color:#9cc2ff}}
+    .ok{{color:#55d38a}} .warn{{color:#e9c46a}} .bad{{color:#ef6f6c}}
+  </style>
+</head><body>
+  <div class="wrap">
+    <div class="card">
+      <h1 id="title">Report</h1>
+      <div id="meta"><small id="status">loading…</small></div>
+      <div style="margin-top:8px">
+        <span class="pill">Total pages: <strong id="total">0</strong></span>
+        <span class="pill">Broken: <strong id="broken">0</strong></span>
+        <span class="pill">Redirect issues: <strong id="redirects">0</strong></span>
+        <span class="pill">Mixed content: <strong id="mixed">0</strong></span>
+        <span class="pill">Large pages: <strong id="large">0</strong></span>
+      </div>
+      <div style="margin-top:8px">
+        <a id="dlCsv" href="#">Download CSV (issues)</a> •
+        <a id="dlJson" href="#">JSON</a>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h2 style="margin:0 0 8px">Pages</h2>
+      <table id="pagesTbl">
+        <thead><tr>
+          <th>Title</th><th>URL</th><th>Status</th><th>Bytes</th><th>Time</th><th>Redirects</th>
+        </tr></thead>
+        <tbody id="pagesBody"><tr><td colspan="6">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+(async function() {{
+  const id = new URLSearchParams(location.search).get('id');
+  const statusEl = document.getElementById('status');
+  const totalEl = document.getElementById('total');
+  const brokenEl = document.getElementById('broken');
+  const redirectsEl = document.getElementById('redirects');
+  const mixedEl = document.getElementById('mixed');
+  const largeEl = document.getElementById('large');
+  const bodyEl = document.getElementById('pagesBody');
+  const titleEl = document.getElementById('title');
+
+  if(!id) {{
+    statusEl.textContent = 'Missing ?id=…';
+    bodyEl.innerHTML = '<tr><td colspan="6">Missing report id.</td></tr>';
+    return;
+  }}
+
+  const res = await fetch('/api/report?id=' + encodeURIComponent(id));
+  const dataTxt = await res.text();
+  let data; try {{ data = JSON.parse(dataTxt); }} catch {{ data = {{}}; }}
+  if(!res.ok) {{
+    statusEl.textContent = 'HTTP ' + res.status;
+    bodyEl.innerHTML = '<tr><td colspan="6">Could not load report.</td></tr>';
+    return;
+  }}
+
+  // Expected shape:
+  // {{ url, status, created_at, pages: [{{title,url,status,bytes,time_ms|ms,redirects,mixed}}], issues_csv_url, json_url, large_threshold }}
+  titleEl.textContent = 'Report';
+  statusEl.textContent = (data.status || 'done') + ' — ' + (data.url || '');
+  document.getElementById('dlCsv').href = data.issues_csv_url || ('/api/report.csv?id=' + encodeURIComponent(id));
+  document.getElementById('dlJson').href = data.json_url || ('/api/report?id=' + encodeURIComponent(id));
+
+  const pages = Array.isArray(data.pages) ? data.pages : [];
+  const THRESH = Number(data.large_threshold || 2000000); // 2MB default
+
+  // --- Compute counters from rows ---
+  const total = pages.length;
+  const broken = pages.filter(p => (Number(p.status)||0) === 0 || Number(p.status) >= 400).length;
+  const redirs = pages.filter(p => Number(p.redirects||0) > 0).length;
+  const mixed  = pages.filter(p => p.mixed === true).length;
+  const large  = pages.filter(p => Number(p.bytes||0) > THRESH).length;
+
+  totalEl.textContent = total;
+  brokenEl.textContent = broken;
+  redirectsEl.textContent = redirs;
+  mixedEl.textContent = mixed;
+  largeEl.textContent = large;
+
+  // Render table
+  if(!pages.length) {{
+    bodyEl.innerHTML = '<tr><td colspan="6">No pages recorded.</td></tr>';
+  }} else {{
+    const rows = pages.map(p => {{
+      const st = Number(p.status||0);
+      const cls = st===0||st>=400 ? 'bad' : (st>=300&&st<400 ? 'warn' : 'ok');
+      const ms = Number(p.time_ms || p.ms || 0);
+      return `<tr>
+        <td>${{String(p.title||'').replace(/</g,'&lt;')}}</td>
+        <td><a href="${{p.url}}" target="_blank" rel="noopener">${{p.url}}</a></td>
+        <td class="${{cls}}">${{st||0}}</td>
+        <td>${{Number(p.bytes||0).toLocaleString()}}</td>
+        <td>${{ms}} ms</td>
+        <td>${{Number(p.redirects||0)}}</td>
+      </tr>`;
+    }}).join('');
+    bodyEl.innerHTML = rows;
+  }}
+}})();
+</script>
+</body></html>
+"""
+    return HTMLResponse(html)
+# === END LINKWATCH PATCH v0.2 ===
 
 # ---------- Run local ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
